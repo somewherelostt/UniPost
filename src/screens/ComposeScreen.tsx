@@ -23,15 +23,30 @@ import {
   type ConnectablePlatform,
   type MediaType,
   type Platform,
+  type PlatformPost,
 } from '../types';
 import { color, radius, space, touchTarget, type } from '../theme';
 import PlatformBadge from '../components/PlatformBadge';
 
 interface ComposeScreenProps {
   onGenerated: (postId: Id<'posts'>, platforms: Platform[]) => void;
+  onOpenAccounts: () => void;
+  onOpenDraft: (postId: Id<'posts'>, platforms: Platform[]) => void;
 }
 
-export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
+const STARTER_BRIEFS = ['What I shipped this week', 'A lesson from a bug', 'A behind-the-scenes update'];
+
+const DISCONNECTED_STATUS: Record<ConnectablePlatform, boolean> = {
+  linkedin: false,
+  youtube: false,
+  instagram: false,
+  pinterest: false,
+  facebook: false,
+  twitter: false,
+  threads: false,
+};
+
+export default function ComposeScreen({ onGenerated, onOpenAccounts, onOpenDraft }: ComposeScreenProps) {
   const [brief, setBrief] = useState('');
   const [mediaUri, setMediaUri] = useState<string | undefined>();
   const [mediaMimeType, setMediaMimeType] = useState<string | undefined>();
@@ -40,8 +55,13 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
   const [generating, setGenerating] = useState(false);
   const [postingDirectly, setPostingDirectly] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [generationProgress, setGenerationProgress] = useState<
+    Partial<Record<Platform, 'queued' | 'writing' | 'ready' | 'failed'>>
+  >({});
+  const [dismissedOnboarding, setDismissedOnboarding] = useState(false);
 
   const platformStatus = useQuery(api.queries.getPlatformStatus);
+  const posts = useQuery(api.queries.listPosts);
   const generateUploadUrl = useMutation(api.queries.generateUploadUrl);
   const createPost = useMutation(api.queries.createPost);
   const createPlatformPost = useMutation(api.queries.createPlatformPost);
@@ -58,7 +78,9 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
     try {
       setConnectionStatus(await checkConnections({}));
     } catch {
-      // leave connectionStatus as-is; the chip falls back to "Not connected" until this succeeds
+      // A broker/network failure must not make disconnected destinations look selectable.
+      // Preserve a previously confirmed state, but fail closed on the first check.
+      setConnectionStatus((previous) => previous ?? DISCONNECTED_STATUS);
     } finally {
       setCheckingConnections(false);
     }
@@ -136,22 +158,30 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
       const mediaStorageId = await uploadMedia();
       const postId = await createPost({ brief, mediaType, mediaStorageId });
       const platforms = Array.from(selected);
+      setGenerationProgress(Object.fromEntries(platforms.map((platform) => [platform, 'queued'])));
 
       await Promise.all(
         platforms.map(async (platform) => {
-          const { generatedText, youtubeTitle } = await generatePost({ brief, platform });
-          const { cleanedText, findings } = checkSlop(
-            generatedText,
-            PLATFORMS_ALLOWING_HASHTAGS.includes(platform)
-          );
-          await createPlatformPost({
-            postId,
-            platform,
-            generatedText,
-            finalText: cleanedText,
-            youtubeTitle,
-            slopFindings: findings,
-          });
+          setGenerationProgress((prev) => ({ ...prev, [platform]: 'writing' }));
+          try {
+            const { generatedText, youtubeTitle } = await generatePost({ brief, platform });
+            const { cleanedText, findings } = checkSlop(
+              generatedText,
+              PLATFORMS_ALLOWING_HASHTAGS.includes(platform)
+            );
+            await createPlatformPost({
+              postId,
+              platform,
+              generatedText,
+              finalText: cleanedText,
+              youtubeTitle,
+              slopFindings: findings,
+            });
+            setGenerationProgress((prev) => ({ ...prev, [platform]: 'ready' }));
+          } catch (platformError) {
+            setGenerationProgress((prev) => ({ ...prev, [platform]: 'failed' }));
+            throw platformError;
+          }
         })
       );
 
@@ -196,25 +226,69 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
   const canGenerate = brief.trim().length > 0 && selected.size > 0 && !busy;
   const canPostDirectly = brief.trim().length > 0 && selected.size > 0 && !busy;
 
-  // Compose only offers platform *selection* now — connecting and disconnecting accounts moved to
-  // the dedicated Accounts tab. Chosen approach: hide not-yet-connected platforms entirely rather
-  // than show them muted with a "Connect in Accounts tab" hint. This is the simplest, most literal
-  // reading of "only allow user to select platform they want to compose post for" — a platform you
-  // can't post to has no business occupying space on this screen, and the Accounts tab is one tap
-  // away for anyone who wants to add one. Still-loading platforms (isConnected === undefined) stay
-  // visible with a spinner so the list doesn't visibly shrink then grow back on every screen open.
+  // Keep every supported destination discoverable here. Connected services can be selected;
+  // disconnected services act as a clear route into Accounts instead of silently disappearing.
   const comingSoonSet = new Set(PLATFORMS_NOT_YET_AVAILABLE);
-  const availablePlatforms = PLATFORMS.filter(
-    (platform) => !comingSoonSet.has(platform) && !(platform !== 'bluesky' && isConnected(platform) === false)
+  const availablePlatforms = PLATFORMS.filter((platform) => !comingSoonSet.has(platform));
+  const hasConnectedDestination = Boolean(
+    platformStatus?.bluesky || Object.values(connectionStatus ?? {}).some(Boolean)
   );
+  const connectionCheckFinished = platformStatus !== undefined && connectionStatus !== null;
+  const draftPosts = (posts ?? []).filter((post) =>
+    post.platformPosts.some((platformPost: PlatformPost) => platformPost.status === 'draft' || platformPost.status === 'approved')
+  );
+  const latestDraft = draftPosts[0];
+
+  if (connectionCheckFinished && !hasConnectedDestination && !dismissedOnboarding) {
+    return (
+      <View style={styles.welcomeScreen}>
+        <View style={styles.welcomeMark}>
+          <MaterialCommunityIcons name="source-branch" size={24} color={color.onPrimaryContainer} />
+        </View>
+        <Text style={styles.welcomeTitle}>Create once.{`\n`}Publish everywhere.</Text>
+        <Text style={styles.welcomeText}>
+          Write one idea. UniPost adapts it for each platform — and you approve every word before it goes out.
+        </Text>
+        <View style={styles.welcomePlatforms}>
+          {PLATFORMS.filter((platform) => !comingSoonSet.has(platform)).map((platform) => (
+            <View key={platform} style={styles.welcomePlatformChip}>
+              <PlatformBadge platform={platform} size={20} />
+              <Text style={styles.welcomePlatformText}>{PLATFORM_LABELS[platform]}</Text>
+            </View>
+          ))}
+        </View>
+        <Pressable style={styles.welcomePrimary} onPress={onOpenAccounts}>
+          <Text style={styles.welcomePrimaryText}>Connect a destination</Text>
+        </Pressable>
+        <Pressable style={styles.welcomeSecondary} onPress={() => setDismissedOnboarding(true)}>
+          <Text style={styles.welcomeSecondaryText}>Skip for now</Text>
+        </Pressable>
+      </View>
+    );
+  }
 
   return (
     <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-      <View>
-        <Text style={styles.title}>UniPost</Text>
-        <Text style={styles.subtitle}>Create once. Publish everywhere.</Text>
+      <View style={styles.composeHeader}>
+        <View>
+          <Text style={styles.title}>Compose</Text>
+        </View>
+        {latestDraft ? (
+          <Pressable
+            style={styles.draftsButton}
+            onPress={() => onOpenDraft(
+              latestDraft._id,
+              latestDraft.platformPosts
+                .filter((platformPost: PlatformPost) => platformPost.status === 'draft' || platformPost.status === 'approved')
+                .map((platformPost: PlatformPost) => platformPost.platform)
+            )}
+          >
+            <Text style={styles.draftsButtonText}>Drafts · {draftPosts.length}</Text>
+          </Pressable>
+        ) : null}
       </View>
 
+      <Text style={styles.eyebrow}>WHAT'S THE IDEA?</Text>
       <TextInput
         style={styles.input}
         placeholder="What do you want to post?"
@@ -223,6 +297,22 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
         value={brief}
         onChangeText={setBrief}
       />
+
+      {brief.trim().length === 0 ? (
+        <View style={styles.starterRow}>
+          {STARTER_BRIEFS.map((starter) => (
+            <Pressable key={starter} style={styles.starterChip} onPress={() => setBrief(starter)}>
+              <MaterialCommunityIcons name="creation" size={13} color={color.onPrimaryContainer} />
+              <Text style={styles.starterText}>{starter}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
+
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionLabel}>MEDIA</Text>
+        <Text style={styles.optionalLabel}>Optional</Text>
+      </View>
 
       {mediaUri ? (
         <View style={styles.mediaBlock}>
@@ -240,43 +330,55 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
           </Pressable>
         </View>
       ) : (
-        <Pressable style={styles.secondaryButton} onPress={pickMedia}>
-          <MaterialCommunityIcons name="image-plus" size={16} color={color.onSurfaceVariant} />
-          <Text style={styles.secondaryButtonText}>Add photo or video</Text>
-        </Pressable>
+        <View style={styles.mediaActions}>
+          <Pressable style={styles.mediaButton} onPress={pickMedia}>
+            <MaterialCommunityIcons name="plus" size={16} color={color.onSurface} />
+            <Text style={styles.mediaButtonText}>Photo</Text>
+          </Pressable>
+          <Pressable style={styles.mediaButton} onPress={pickMedia}>
+            <MaterialCommunityIcons name="plus" size={16} color={color.onSurface} />
+            <Text style={styles.mediaButtonText}>Video</Text>
+          </Pressable>
+        </View>
       )}
 
       <View>
         <View style={styles.sectionHeader}>
-          <Text style={styles.sectionLabel}>Platforms</Text>
-          <Pressable
-            onPress={refreshConnections}
-            disabled={checkingConnections}
-            hitSlop={8}
-            style={styles.refreshButton}
-          >
-            {checkingConnections ? (
-              <ActivityIndicator size="small" color={color.onSurfaceFaint} />
-            ) : (
-              <MaterialCommunityIcons name="refresh" size={16} color={color.onSurfaceFaint} />
-            )}
-          </Pressable>
+          <Text style={styles.sectionLabel}>Destinations · {selected.size}</Text>
+          <View style={styles.sectionActions}>
+            <Pressable style={styles.manageButton} onPress={onOpenAccounts}>
+              <Text style={styles.manageButtonText}>Manage</Text>
+            </Pressable>
+            <Pressable
+              onPress={refreshConnections}
+              disabled={checkingConnections}
+              hitSlop={8}
+              style={styles.refreshButton}
+            >
+              {checkingConnections ? (
+                <ActivityIndicator size="small" color={color.onSurfaceFaint} />
+              ) : (
+                <MaterialCommunityIcons name="refresh" size={16} color={color.onSurfaceFaint} />
+              )}
+            </Pressable>
+          </View>
         </View>
         <View style={styles.chipRow}>
           {availablePlatforms.map((platform) => {
             const isSelected = selected.has(platform);
-            const pending = platform !== 'bluesky' && isConnected(platform) === undefined;
+            const connected = isConnected(platform);
+            const pending = platform !== 'bluesky' && connected === undefined;
             return (
               <Pressable
                 key={platform}
-                style={[styles.chip, isSelected && styles.chipSelected]}
-                onPress={() => togglePlatform(platform)}
+                style={[styles.chip, isSelected && styles.chipSelected, connected === false && styles.chipDisconnected]}
+                onPress={() => connected === false ? onOpenAccounts() : togglePlatform(platform)}
                 hitSlop={{ top: 6, bottom: 6 }}
                 android_ripple={{ color: color.outline }}
               >
                 <PlatformBadge platform={platform} size={20} />
                 <Text style={[styles.chipLabel, isSelected && styles.chipLabelSelected]}>
-                  {PLATFORM_LABELS[platform]}
+                  {PLATFORM_LABELS[platform]}{connected === false ? ' · connect' : ''}
                 </Text>
                 {pending ? (
                   <ActivityIndicator size="small" color={color.onSurfaceFaint} />
@@ -286,8 +388,43 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
               </Pressable>
             );
           })}
+          <Pressable
+            style={styles.addPlatformChip}
+            onPress={onOpenAccounts}
+            accessibilityRole="button"
+            accessibilityLabel="Connect another platform"
+            accessibilityHint="Opens the Accounts page"
+            android_ripple={{ color: color.outline, borderless: true }}
+          >
+            <MaterialCommunityIcons name="plus" size={22} color={color.onSurfaceVariant} />
+          </Pressable>
         </View>
+        {mediaType === 'none' && (selected.has('youtube') || selected.has('pinterest')) ? (
+          <View style={styles.advisoryRow}>
+            <MaterialCommunityIcons name="information-outline" size={15} color={color.info} />
+            <Text style={styles.advisoryText}>YouTube and Pinterest require media before publishing.</Text>
+          </View>
+        ) : null}
       </View>
+
+      {generating ? (
+        <View style={styles.progressCard}>
+          <Text style={styles.progressTitle}>Adapting your brief</Text>
+          <Text style={styles.progressSubtitle}>You’ll review every draft before anything publishes.</Text>
+          {Array.from(selected).map((platform) => {
+            const state = generationProgress[platform] ?? 'queued';
+            return (
+              <View key={platform} style={styles.progressRow}>
+                <PlatformBadge platform={platform} size={22} />
+                <Text style={styles.progressPlatform}>{PLATFORM_LABELS[platform]}</Text>
+                <Text style={[styles.progressState, state === 'ready' && styles.progressReady, state === 'failed' && styles.progressFailed]}>
+                  {state === 'writing' ? 'Writing…' : state === 'ready' ? 'Ready' : state === 'failed' ? 'Failed' : 'Queued'}
+                </Text>
+              </View>
+            );
+          })}
+        </View>
+      ) : null}
 
       {error ? (
         <View style={styles.errorBanner}>
@@ -314,6 +451,10 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
         )}
       </Pressable>
 
+      {!busy && selected.size === 0 ? (
+        <Text style={styles.disabledReason}>Connect and select at least one destination to continue.</Text>
+      ) : null}
+
       <Pressable
         style={[styles.postDirectlyButton, !canPostDirectly && styles.generateButtonDisabled]}
         onPress={handlePostDirectly}
@@ -326,7 +467,7 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
           <>
             <MaterialCommunityIcons name="send-outline" size={18} color={color.onSurface} />
             <Text style={styles.postDirectlyButtonText}>
-              Post as-is to {selected.size} platform{selected.size === 1 ? '' : 's'}
+              Use my own copy for {selected.size} platform{selected.size === 1 ? '' : 's'}
             </Text>
           </>
         )}
@@ -336,20 +477,63 @@ export default function ComposeScreen({ onGenerated }: ComposeScreenProps) {
 }
 
 const styles = StyleSheet.create({
-  container: { padding: space.xl, paddingTop: space.xxl, gap: space.lg, paddingBottom: space.xxxl },
+  welcomeScreen: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: space.xxl,
+    paddingBottom: space.xxxl,
+    gap: space.md,
+  },
+  welcomeMark: {
+    width: 48,
+    height: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radius.md,
+    backgroundColor: color.primaryContainer,
+    marginBottom: space.xs,
+  },
+  welcomeTitle: { ...type.headlineSmall, color: color.onBackground, textAlign: 'center', lineHeight: 32 },
+  welcomeText: { ...type.bodyMedium, color: color.onSurfaceVariant, textAlign: 'center', maxWidth: 330 },
+  welcomePlatforms: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: space.sm, marginVertical: space.sm },
+  welcomePlatformChip: { flexDirection: 'row', alignItems: 'center', gap: space.xs, borderWidth: 1, borderColor: color.outline, borderRadius: radius.pill, paddingVertical: 6, paddingHorizontal: space.sm },
+  welcomePlatformText: { ...type.labelSmall, color: color.onSurfaceVariant, textTransform: 'none' },
+  welcomePrimary: { width: '100%', minHeight: touchTarget + 4, alignItems: 'center', justifyContent: 'center', borderRadius: radius.md, backgroundColor: color.primary, marginTop: space.sm },
+  welcomePrimaryText: { ...type.labelLarge, color: color.onPrimary, textTransform: 'none' },
+  welcomeSecondary: { minHeight: touchTarget, alignItems: 'center', justifyContent: 'center', paddingHorizontal: space.xl },
+  welcomeSecondaryText: { ...type.labelMedium, color: color.onSurfaceFaint, textTransform: 'none' },
+  container: { padding: space.lg, paddingTop: space.xl, gap: space.md, paddingBottom: space.xxxl },
+  composeHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: space.md },
   title: { ...type.headlineSmall, color: color.onBackground },
   subtitle: { ...type.bodyMedium, color: color.onSurfaceVariant, marginTop: 2 },
+  eyebrow: { ...type.labelSmall, color: color.onSurfaceFaint, letterSpacing: 0.8, marginTop: space.xs },
+  draftsButton: { minHeight: 40, justifyContent: 'center', paddingHorizontal: space.md, backgroundColor: color.surface, borderRadius: radius.sm },
+  draftsButtonText: { ...type.labelMedium, color: color.onPrimaryContainer, textTransform: 'none' },
   input: {
     borderWidth: 1,
     borderColor: color.outline,
-    backgroundColor: color.surface,
+    backgroundColor: color.background,
     borderRadius: radius.md,
-    padding: space.lg,
-    minHeight: 110,
+    padding: space.md,
+    minHeight: 96,
     fontSize: 16,
     color: color.onSurface,
     textAlignVertical: 'top',
   },
+  starterRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm, marginTop: -space.xs },
+  starterChip: {
+    minHeight: 40,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.xs,
+    borderWidth: 1,
+    borderColor: color.outline,
+    backgroundColor: color.background,
+    borderRadius: radius.pill,
+    paddingHorizontal: space.md,
+  },
+  starterText: { ...type.labelMedium, color: color.onSurfaceVariant, textTransform: 'none' },
   mediaBlock: { gap: space.sm },
   preview: { width: '100%', height: 200, borderRadius: radius.md },
   videoPreview: { alignItems: 'center', justifyContent: 'center', backgroundColor: color.surfaceVariant, gap: space.xs },
@@ -366,6 +550,18 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.lg,
   },
   secondaryButtonText: { ...type.labelLarge, color: color.onSurfaceVariant, textTransform: 'none' },
+  mediaActions: { flexDirection: 'row', gap: space.sm, marginTop: -space.sm },
+  mediaButton: {
+    minHeight: 38,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    borderWidth: 1,
+    borderColor: color.outline,
+    borderRadius: radius.pill,
+    paddingHorizontal: space.md,
+  },
+  mediaButtonText: { ...type.labelMedium, color: color.onSurface, textTransform: 'none' },
   sectionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -373,6 +569,10 @@ const styles = StyleSheet.create({
     marginBottom: space.sm,
   },
   sectionLabel: { ...type.labelMedium, color: color.onSurfaceVariant },
+  optionalLabel: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none' },
+  sectionActions: { flexDirection: 'row', alignItems: 'center', gap: space.sm },
+  manageButton: { minHeight: 40, justifyContent: 'center', paddingHorizontal: space.sm },
+  manageButtonText: { ...type.labelMedium, color: color.onPrimaryContainer, textTransform: 'none' },
   refreshButton: { width: touchTarget / 2, height: touchTarget / 2, alignItems: 'center', justifyContent: 'center' },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm },
   chip: {
@@ -382,13 +582,35 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: color.outline,
     backgroundColor: color.surface,
-    borderRadius: radius.sm,
-    paddingVertical: space.sm,
-    paddingHorizontal: space.md,
+    borderRadius: radius.pill,
+    paddingVertical: 7,
+    paddingHorizontal: space.sm,
   },
   chipSelected: { borderColor: 'transparent', backgroundColor: color.primaryContainer },
+  chipDisconnected: { opacity: 0.52 },
   chipLabel: { ...type.labelLarge, color: color.onSurface, textTransform: 'none' },
   chipLabelSelected: { color: color.onPrimaryContainer },
+  addPlatformChip: {
+    width: 38,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: color.outline,
+    backgroundColor: color.surface,
+    borderRadius: radius.pill,
+  },
+  advisoryRow: { flexDirection: 'row', alignItems: 'flex-start', gap: space.xs, marginTop: space.sm },
+  advisoryText: { ...type.labelSmall, color: color.onSurfaceVariant, textTransform: 'none', flex: 1 },
+  progressCard: { backgroundColor: color.surface, borderRadius: radius.lg, padding: space.lg, gap: space.sm },
+  progressTitle: { ...type.titleMedium, color: color.onSurface },
+  progressSubtitle: { ...type.bodyMedium, color: color.onSurfaceVariant },
+  progressRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, minHeight: 36 },
+  progressPlatform: { ...type.bodyMedium, color: color.onSurface, flex: 1 },
+  progressState: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'uppercase' },
+  progressReady: { color: color.success },
+  progressFailed: { color: color.error },
+  disabledReason: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none', textAlign: 'center', marginTop: -space.sm },
   errorBanner: {
     flexDirection: 'row',
     alignItems: 'flex-start',

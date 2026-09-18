@@ -1,7 +1,7 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { View, Text, ScrollView, StyleSheet, ActivityIndicator, Pressable, Linking } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { useMutation, useQuery } from 'convex/react';
+import { useAction, useQuery } from 'convex/react';
 import { api } from '../../convex/_generated/api';
 import type { Id } from '../../convex/_generated/dataModel';
 import { PLATFORM_LABELS } from '../types';
@@ -82,9 +82,18 @@ function descriptionSegments(status: PlatformPostStatus, platformLabel: string):
   }
 }
 
-export default function HistoryScreen() {
+interface HistoryScreenProps {
+  onEdit: (postId: Id<'posts'>, platforms: Platform[]) => void;
+}
+
+type HistoryFilter = 'all' | 'published' | 'failed';
+
+export default function HistoryScreen({ onEdit }: HistoryScreenProps) {
   const events = useQuery(api.queries.listTimelineEvents) as TimelineEvent[] | undefined;
-  const cancelSchedule = useMutation(api.schedulePost.cancelSchedule);
+  const publishPost = useAction(api.publishPost.publishPost);
+  const [filter, setFilter] = useState<HistoryFilter>('all');
+  const [retryingId, setRetryingId] = useState<Id<'platformPosts'> | null>(null);
+  const [retryError, setRetryError] = useState<string | null>(null);
 
   if (events === undefined) {
     return (
@@ -94,22 +103,59 @@ export default function HistoryScreen() {
     );
   }
 
-  if (events.length === 0) {
+  const historyEvents = events.filter(
+    (event) => event.status !== 'scheduled' && (filter === 'all' || event.status === filter)
+  );
+
+  async function handleRetry(event: TimelineEvent) {
+    setRetryError(null);
+    setRetryingId(event._id);
+    try {
+      await publishPost({ postId: event.postId, platforms: [event.platform] });
+    } catch (err) {
+      setRetryError(err instanceof Error ? err.message : 'Could not retry this post.');
+    } finally {
+      setRetryingId(null);
+    }
+  }
+
+  if (events.filter((event) => event.status !== 'scheduled').length === 0) {
     return (
-      <View style={styles.centered}>
-        <MaterialCommunityIcons name="history" size={36} color={color.onSurfaceFaint} />
-        <Text style={styles.emptyText}>No posts yet. Compose your first one.</Text>
-      </View>
+      <ScrollView contentContainerStyle={styles.emptyContainer}>
+        <Text style={styles.title}>History</Text>
+        <View style={styles.centered}>
+          <MaterialCommunityIcons name="history" size={36} color={color.onSurfaceFaint} />
+          <Text style={styles.emptyTitle}>Nothing published yet</Text>
+          <Text style={styles.emptyText}>Your first published post will appear here.</Text>
+        </View>
+      </ScrollView>
     );
   }
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>History</Text>
+      <View style={styles.filterRow}>
+        {(['all', 'published', 'failed'] as HistoryFilter[]).map((item) => (
+          <Pressable
+            key={item}
+            style={[styles.filterChip, filter === item && styles.filterChipActive]}
+            onPress={() => setFilter(item)}
+          >
+            <Text style={[styles.filterText, filter === item && styles.filterTextActive]}>
+              {item[0].toUpperCase() + item.slice(1)}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+      {retryError ? <View style={styles.errorBanner}><Text style={styles.errorText}>{retryError}</Text></View> : null}
+      {historyEvents.length === 0 ? (
+        <View style={styles.filteredEmpty}><Text style={styles.emptyText}>No {filter} posts yet.</Text></View>
+      ) : null}
       <View>
-        {events.map((ev, index) => {
+        {historyEvents.map((ev, index) => {
           const isFirst = index === 0;
-          const isLast = index === events.length - 1;
+          const isLast = index === historyEvents.length - 1;
           const platformLabel = PLATFORM_LABELS[ev.platform];
 
           return (
@@ -137,9 +183,26 @@ export default function HistoryScreen() {
                 </Text>
 
                 {ev.status === 'failed' && ev.error && (
-                  <Text style={styles.detailText} numberOfLines={1}>
-                    {ev.error}
-                  </Text>
+                  <View style={styles.failureBlock}>
+                    <Text style={styles.detailText}>{ev.error}</Text>
+                    <View style={styles.failureActions}>
+                      <Pressable
+                        style={styles.retryButton}
+                        onPress={() => handleRetry(ev)}
+                        disabled={retryingId === ev._id}
+                      >
+                        {retryingId === ev._id ? (
+                          <ActivityIndicator size="small" color={color.onPrimary} />
+                        ) : (
+                          <><MaterialCommunityIcons name="refresh" size={14} color={color.onPrimary} /><Text style={styles.retryText}>Retry</Text></>
+                        )}
+                      </Pressable>
+                      <Pressable style={styles.editButton} onPress={() => onEdit(ev.postId, [ev.platform])}>
+                        <MaterialCommunityIcons name="pencil-outline" size={14} color={color.onSurfaceVariant} />
+                        <Text style={styles.editText}>Edit draft</Text>
+                      </Pressable>
+                    </View>
+                  </View>
                 )}
 
                 {ev.status === 'published' && ev.url && (
@@ -154,22 +217,6 @@ export default function HistoryScreen() {
                   </Pressable>
                 )}
 
-                {ev.status === 'scheduled' && ev.scheduledFor !== undefined && (
-                  <View style={styles.scheduledRow}>
-                    <Text style={styles.detailText} numberOfLines={1}>
-                      {formatScheduledFor(ev.scheduledFor)}
-                    </Text>
-                    <Pressable
-                      style={styles.cancelButton}
-                      onPress={() => cancelSchedule({ platformPostId: ev._id })}
-                      hitSlop={{ top: 8, bottom: 8 }}
-                      android_ripple={{ color: color.outline }}
-                    >
-                      <MaterialCommunityIcons name="close" size={13} color={color.onSurfaceVariant} />
-                      <Text style={styles.cancelButtonText}>Cancel</Text>
-                    </Pressable>
-                  </View>
-                )}
               </View>
             </View>
           );
@@ -181,9 +228,19 @@ export default function HistoryScreen() {
 
 const styles = StyleSheet.create({
   container: { padding: space.xl, paddingTop: space.xxl, paddingBottom: space.xxxl },
+  emptyContainer: { flexGrow: 1, padding: space.xl, paddingTop: space.xxl, paddingBottom: space.xxxl },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: space.md },
+  emptyTitle: { ...type.titleMedium, color: color.onSurface },
   emptyText: { ...type.bodyMedium, color: color.onSurfaceFaint },
   title: { ...type.headlineSmall, color: color.onBackground, marginBottom: space.lg },
+  filterRow: { flexDirection: 'row', gap: space.sm, marginBottom: space.lg },
+  filterChip: { minHeight: 40, justifyContent: 'center', paddingHorizontal: space.md, borderRadius: radius.pill, backgroundColor: color.surface },
+  filterChipActive: { backgroundColor: color.primaryContainer },
+  filterText: { ...type.labelMedium, color: color.onSurfaceVariant, textTransform: 'none' },
+  filterTextActive: { color: color.onPrimaryContainer },
+  filteredEmpty: { padding: space.xxl, alignItems: 'center' },
+  errorBanner: { backgroundColor: color.errorContainer, borderRadius: radius.sm, padding: space.md, marginBottom: space.lg },
+  errorText: { ...type.bodyMedium, color: color.onErrorContainer },
 
   row: { flexDirection: 'row' },
   iconColumn: { width: ICON_SIZE, alignItems: 'center' },
@@ -202,6 +259,12 @@ const styles = StyleSheet.create({
   brief: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none' },
 
   detailText: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none' },
+  failureBlock: { gap: space.sm, marginTop: space.xs },
+  failureActions: { flexDirection: 'row', gap: space.sm },
+  retryButton: { minHeight: 40, flexDirection: 'row', alignItems: 'center', gap: space.xs, backgroundColor: color.primary, borderRadius: radius.sm, paddingHorizontal: space.md },
+  retryText: { ...type.labelMedium, color: color.onPrimary, textTransform: 'none' },
+  editButton: { minHeight: 40, flexDirection: 'row', alignItems: 'center', gap: space.xs, backgroundColor: color.surfaceRaised, borderRadius: radius.sm, paddingHorizontal: space.md },
+  editText: { ...type.labelMedium, color: color.onSurfaceVariant, textTransform: 'none' },
   viewPostButton: {
     flexDirection: 'row',
     alignItems: 'center',

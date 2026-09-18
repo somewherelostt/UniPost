@@ -5,6 +5,7 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { ConvexProvider, ConvexReactClient } from 'convex/react';
 import ComposeScreen from './src/screens/ComposeScreen';
 import ReviewScreen from './src/screens/ReviewScreen';
+import QueueScreen from './src/screens/QueueScreen';
 import HistoryScreen from './src/screens/HistoryScreen';
 import AccountsScreen from './src/screens/AccountsScreen';
 import AnalyticsScreen from './src/screens/AnalyticsScreen';
@@ -14,14 +15,14 @@ import { color, space, touchTarget, type } from './src/theme';
 
 const convex = new ConvexReactClient(process.env.EXPO_PUBLIC_CONVEX_URL as string);
 
-type Screen = 'compose' | 'review' | 'history' | 'accounts' | 'analytics';
+type Screen = 'compose' | 'review' | 'queue' | 'history' | 'accounts' | 'analytics';
 
 // 'chart-line' confirmed present in the installed MaterialCommunityIcons glyph map
 // (node_modules/@expo/vector-icons/build/vendor/react-native-vector-icons/glyphmaps/MaterialCommunityIcons.json),
 // same verification discipline every other icon choice in TABS already follows.
 const TABS: { key: Screen; label: string; icon: keyof typeof MaterialCommunityIcons.glyphMap }[] = [
   { key: 'compose', label: 'Compose', icon: 'pencil-box-outline' },
-  { key: 'review', label: 'Review', icon: 'text-box-check-outline' },
+  { key: 'queue', label: 'Queue', icon: 'calendar-clock-outline' },
   { key: 'history', label: 'History', icon: 'clock-outline' },
   { key: 'analytics', label: 'Analytics', icon: 'chart-line' },
   { key: 'accounts', label: 'Accounts', icon: 'account-multiple-outline' },
@@ -42,28 +43,46 @@ export default function App() {
     setScreen('history');
   }
 
+  function openDraft(postId: Id<'posts'>, platforms: Platform[]) {
+    setActivePostId(postId);
+    setActivePlatforms(platforms);
+    setScreen('review');
+  }
+
   return (
     <ConvexProvider client={convex}>
       <SafeAreaView style={styles.container}>
         <StatusBar style="light" />
 
-        <View style={styles.content}>
-          {screen === 'compose' && <ComposeScreen onGenerated={handleGenerated} />}
+        <View style={[styles.content, screen !== 'review' && styles.contentWithNav]}>
+          {screen === 'compose' && (
+            <ComposeScreen
+              onGenerated={handleGenerated}
+              onOpenAccounts={() => setScreen('accounts')}
+              onOpenDraft={openDraft}
+            />
+          )}
           {screen === 'review' &&
             (activePostId ? (
-              <ReviewScreen postId={activePostId} platforms={activePlatforms} onPublished={handlePublished} />
+              <ReviewScreen
+                postId={activePostId}
+                platforms={activePlatforms}
+                onBack={() => setScreen('compose')}
+                onPublished={handlePublished}
+              />
             ) : (
               <View style={styles.emptyState}>
                 <MaterialCommunityIcons name="text-box-search-outline" size={40} color={color.onSurfaceFaint} />
                 <Text style={styles.emptyStateText}>No draft yet. Generate one from Compose first.</Text>
               </View>
             ))}
-          {screen === 'history' && <HistoryScreen />}
+          {screen === 'queue' && <QueueScreen onEdit={openDraft} />}
+          {screen === 'history' && <HistoryScreen onEdit={openDraft} />}
           {screen === 'analytics' && <AnalyticsScreen />}
           {screen === 'accounts' && <AccountsScreen />}
         </View>
 
-        <View style={styles.navBar}>
+        {screen !== 'review' && <View style={styles.navBar}>
           {TABS.map((tab) => {
             const isActive = screen === tab.key;
             return (
@@ -84,7 +103,7 @@ export default function App() {
               </Pressable>
             );
           })}
-        </View>
+        </View>}
       </SafeAreaView>
     </ConvexProvider>
   );
@@ -98,13 +117,21 @@ const styles = StyleSheet.create({
   content: {
     flex: 1,
   },
+  contentWithNav: {
+    paddingBottom: 66,
+  },
   navBar: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 10,
     flexDirection: 'row',
     borderTopWidth: 1,
     borderTopColor: color.outlineFaint,
-    backgroundColor: color.surface,
-    paddingTop: space.sm,
-    paddingBottom: space.md,
+    backgroundColor: color.background,
+    paddingTop: 6,
+    paddingBottom: space.sm,
   },
   navItem: {
     flex: 1,
@@ -113,9 +140,9 @@ const styles = StyleSheet.create({
     minHeight: touchTarget,
   },
   navIconWrap: {
-    width: 56,
-    height: 32,
-    borderRadius: 16,
+    width: 44,
+    height: 26,
+    borderRadius: 13,
     alignItems: 'center',
     justifyContent: 'center',
   },

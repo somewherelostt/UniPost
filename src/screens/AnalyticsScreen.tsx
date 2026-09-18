@@ -54,6 +54,8 @@ export default function AnalyticsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [lastRefreshNote, setLastRefreshNote] = useState<string | null>(null);
+  const [rangeDays, setRangeDays] = useState<7 | 28 | 90>(7);
+  const [sortBy, setSortBy] = useState<'recent' | 'likes' | 'views'>('recent');
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -80,6 +82,26 @@ export default function AnalyticsScreen() {
       </View>
     );
   }
+
+  const cutoff = Date.now() - rangeDays * 24 * 60 * 60 * 1000;
+  const rangePosts = summary.posts.filter((row) => (row.publishedAt ?? 0) >= cutoff);
+  const sortedPosts = [...rangePosts].sort((a, b) => {
+    if (sortBy === 'likes') return (b.likes ?? 0) - (a.likes ?? 0);
+    if (sortBy === 'views') return (b.views ?? 0) - (a.views ?? 0);
+    return (b.publishedAt ?? 0) - (a.publishedAt ?? 0);
+  });
+  const rangeSummaries = (['bluesky', 'facebook'] as MetricsPlatform[]).map((platform) => {
+    const rows = rangePosts.filter((row) => row.platform === platform);
+    return {
+      platform,
+      postCount: rows.length,
+      totalLikes: rows.reduce((sum, row) => sum + (row.likes ?? 0), 0),
+      totalReposts: rows.reduce((sum, row) => sum + (row.reposts ?? 0), 0),
+      totalComments: rows.reduce((sum, row) => sum + (row.comments ?? 0), 0),
+      totalViews: rows.reduce((sum, row) => sum + (row.views ?? 0), 0),
+    };
+  }).filter((entry) => entry.postCount > 0);
+  const latestFetch = rangePosts.reduce((latest, row) => Math.max(latest, row.fetchedAt ?? 0), 0);
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
@@ -114,6 +136,18 @@ export default function AnalyticsScreen() {
         <Text style={styles.refreshNote}>{lastRefreshNote}</Text>
       ) : null}
 
+      <View style={styles.rangeRow}>
+        {[7, 28, 90].map((days) => (
+          <Pressable
+            key={days}
+            style={[styles.rangeChip, rangeDays === days && styles.rangeChipActive]}
+            onPress={() => setRangeDays(days as 7 | 28 | 90)}
+          >
+            <Text style={[styles.rangeText, rangeDays === days && styles.rangeTextActive]}>{days} days</Text>
+          </Pressable>
+        ))}
+      </View>
+
       <View style={styles.noticeBox}>
         <MaterialCommunityIcons name="information-outline" size={16} color={color.onSurfaceVariant} />
         <Text style={styles.noticeText}>
@@ -123,7 +157,7 @@ export default function AnalyticsScreen() {
         </Text>
       </View>
 
-      {summary.byPlatform.length === 0 ? (
+      {rangeSummaries.length === 0 ? (
         <View style={styles.centered}>
           <MaterialCommunityIcons name="chart-line" size={36} color={color.onSurfaceFaint} />
           <Text style={styles.emptyText}>
@@ -133,7 +167,7 @@ export default function AnalyticsScreen() {
       ) : (
         <>
           <View style={styles.summaryRow}>
-            {summary.byPlatform.map((entry) => (
+            {rangeSummaries.map((entry) => (
               <View key={entry.platform} style={styles.summaryCard}>
                 <View style={styles.summaryCardHeader}>
                   <PlatformBadge platform={entry.platform} size={24} />
@@ -159,9 +193,22 @@ export default function AnalyticsScreen() {
             ))}
           </View>
 
-          <Text style={styles.sectionTitle}>By post</Text>
+          <Text style={styles.asOfText}>
+            Last {rangeDays} days{latestFetch > 0 ? ` · as of ${new Date(latestFetch).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : ''}
+          </Text>
+
+          <View style={styles.listHeader}>
+            <Text style={styles.sectionTitle}>By post</Text>
+            <View style={styles.sortRow}>
+              {(['recent', 'likes', 'views'] as const).map((sort) => (
+                <Pressable key={sort} onPress={() => setSortBy(sort)} style={[styles.sortButton, sortBy === sort && styles.sortButtonActive]}>
+                  <Text style={[styles.sortText, sortBy === sort && styles.sortTextActive]}>{sort}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
           <View style={styles.list}>
-            {summary.posts.map((row) => (
+            {sortedPosts.map((row) => (
               <View key={row.platformPostId} style={styles.postRow}>
                 <PlatformBadge platform={row.platform} size={28} />
                 <View style={styles.postRowContent}>
@@ -230,6 +277,11 @@ const styles = StyleSheet.create({
   },
   errorText: { ...type.bodyMedium, color: color.onErrorContainer, flex: 1 },
   refreshNote: { ...type.bodyMedium, color: color.onSurfaceVariant },
+  rangeRow: { flexDirection: 'row', gap: space.sm },
+  rangeChip: { minHeight: 40, justifyContent: 'center', paddingHorizontal: space.md, borderRadius: radius.pill, backgroundColor: color.surface },
+  rangeChipActive: { backgroundColor: color.primaryContainer },
+  rangeText: { ...type.labelMedium, color: color.onSurfaceVariant, textTransform: 'none' },
+  rangeTextActive: { color: color.onPrimaryContainer },
 
   noticeBox: {
     flexDirection: 'row',
@@ -259,8 +311,15 @@ const styles = StyleSheet.create({
   summaryCardStatsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm, marginTop: space.xs },
   summaryCardStat: { ...type.labelSmall, color: color.onSurfaceVariant, textTransform: 'none' },
   summaryCardPostCount: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none', marginTop: space.xs },
+  asOfText: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none' },
 
   sectionTitle: { ...type.titleMedium, color: color.onSurface },
+  listHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.sm, flexWrap: 'wrap' },
+  sortRow: { flexDirection: 'row', gap: space.xs },
+  sortButton: { minHeight: 36, justifyContent: 'center', paddingHorizontal: space.sm, borderRadius: radius.sm, backgroundColor: color.surface },
+  sortButtonActive: { backgroundColor: color.surfaceRaised },
+  sortText: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'capitalize' },
+  sortTextActive: { color: color.onSurface },
   list: { gap: space.sm },
   postRow: {
     flexDirection: 'row',

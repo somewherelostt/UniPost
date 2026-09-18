@@ -24,6 +24,7 @@ import StatusPill from '../components/StatusPill';
 interface ReviewScreenProps {
   postId: Id<'posts'>;
   platforms: Platform[];
+  onBack: () => void;
   onPublished: () => void;
 }
 
@@ -45,12 +46,30 @@ function formatScheduledFor(epochMs: number): string {
   });
 }
 
-export default function ReviewScreen({ postId, platforms, onPublished }: ReviewScreenProps) {
+const CHARACTER_LIMITS: Partial<Record<Platform, number>> = {
+  bluesky: 300,
+  twitter: 280,
+  youtube: 5000,
+  instagram: 2200,
+  pinterest: 500,
+  linkedin: 3000,
+  facebook: 63206,
+};
+
+function relativeFuture(epochMs: number): string {
+  const minutes = Math.max(0, Math.round((epochMs - Date.now()) / 60_000));
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `in ${hours} hr${hours === 1 ? '' : 's'}` : `in ${Math.round(hours / 24)} days`;
+}
+
+export default function ReviewScreen({ postId, platforms, onBack, onPublished }: ReviewScreenProps) {
   const post = useQuery(api.queries.getPost, { postId });
   const generatePost = useAction(api.generatePost.generatePost);
   const updatePlatformPost = useMutation(api.queries.updatePlatformPost);
   const publishPost = useAction(api.publishPost.publishPost);
   const schedulePlatformPosts = useMutation(api.schedulePost.schedulePlatformPosts);
+  const cancelSchedule = useMutation(api.schedulePost.cancelSchedule);
 
   const [editedText, setEditedText] = useState<Record<string, string>>({});
   const [editedTitle, setEditedTitle] = useState<Record<string, string>>({});
@@ -60,6 +79,9 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
   const [mode, setMode] = useState<Record<string, PublishMode>>({});
   const [scheduledTime, setScheduledTime] = useState<Record<string, number>>({});
   const [iosPickerFor, setIosPickerFor] = useState<Id<'platformPosts'> | null>(null);
+  const [dismissedFindings, setDismissedFindings] = useState<Set<string>>(new Set());
+  const [confirmRegenerateId, setConfirmRegenerateId] = useState<Id<'platformPosts'> | null>(null);
+  const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (!post) return;
@@ -74,6 +96,27 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
       const next = { ...prev };
       for (const pp of post.platformPosts) {
         if (pp.youtubeTitle !== undefined && !(pp._id in next)) next[pp._id] = pp.youtubeTitle;
+      }
+      return next;
+    });
+    setMode((prev) => {
+      const next = { ...prev };
+      for (const pp of post.platformPosts) {
+        if (pp.status === 'scheduled') next[pp._id] = 'schedule';
+      }
+      return next;
+    });
+    setScheduledTime((prev) => {
+      const next = { ...prev };
+      for (const pp of post.platformPosts) {
+        if (pp.scheduledFor !== undefined) next[pp._id] = pp.scheduledFor;
+      }
+      return next;
+    });
+    setApprovedIds((prev) => {
+      const next = new Set(prev);
+      for (const pp of post.platformPosts) {
+        if (pp.status === 'approved' || pp.status === 'scheduled' || pp.status === 'published') next.add(pp._id);
       }
       return next;
     });
@@ -96,7 +139,7 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
     );
   }
 
-  const orderedPlatformPosts = [...post.platformPosts].sort(
+  const orderedPlatformPosts = post.platformPosts.filter((pp) => platforms.includes(pp.platform)).sort(
     (a, b) => platforms.indexOf(a.platform) - platforms.indexOf(b.platform)
   );
 
@@ -148,6 +191,8 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
   }
 
   async function handleRegenerate(pp: PlatformPost) {
+    setConfirmRegenerateId(null);
+    setApprovedIds((prev) => { const next = new Set(prev); next.delete(pp._id); return next; });
     setError(null);
     setRegeneratingId(pp._id);
     try {
@@ -180,8 +225,39 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
     }
   }
 
+  function applyFinding(pp: PlatformPost, findingIndex: number, quote: string, suggestion: string) {
+    setEditedText((prev) => ({
+      ...prev,
+      [pp._id]: (prev[pp._id] ?? pp.finalText).replace(quote, suggestion),
+    }));
+    setDismissedFindings((prev) => new Set(prev).add(`${pp._id}-${findingIndex}`));
+    setApprovedIds((prev) => { const next = new Set(prev); next.delete(pp._id); return next; });
+  }
+
   async function handlePublish() {
     setError(null);
+
+    const unapproved = orderedPlatformPosts.filter((pp) => !approvedIds.has(pp._id));
+    if (unapproved.length > 0) {
+      setError(`Approve ${unapproved.length} remaining draft${unapproved.length === 1 ? '' : 's'} before publishing.`);
+      return;
+    }
+
+    const overBudget = orderedPlatformPosts.find((pp) => {
+      const limit = CHARACTER_LIMITS[pp.platform];
+      return limit !== undefined && (editedText[pp._id] ?? pp.finalText).length > limit;
+    });
+    if (overBudget) {
+      setError(`${PLATFORM_LABELS[overBudget.platform]} is over its character limit.`);
+      return;
+    }
+    const youtubeWithoutTitle = orderedPlatformPosts.find(
+      (pp) => pp.platform === 'youtube' && !(editedTitle[pp._id] ?? pp.youtubeTitle ?? '').trim()
+    );
+    if (youtubeWithoutTitle) {
+      setError('Add a YouTube title before publishing.');
+      return;
+    }
 
     const scheduleGroup = orderedPlatformPosts.filter((pp) => modeFor(pp._id) === 'schedule');
     const nowGroup = orderedPlatformPosts.filter((pp) => modeFor(pp._id) === 'now');
@@ -220,6 +296,11 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
       }
 
       if (nowGroup.length > 0) {
+        await Promise.all(
+          nowGroup
+            .filter((pp) => pp.status === 'scheduled')
+            .map((pp) => cancelSchedule({ platformPostId: pp._id }))
+        );
         await publishPost({
           postId: post!._id,
           platforms: nowGroup.map((pp) => pp.platform),
@@ -234,6 +315,8 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
 
   const scheduleCount = orderedPlatformPosts.filter((pp) => modeFor(pp._id) === 'schedule').length;
   const nowCount = orderedPlatformPosts.length - scheduleCount;
+  const approvedCount = orderedPlatformPosts.filter((pp) => approvedIds.has(pp._id)).length;
+  const allApproved = orderedPlatformPosts.length > 0 && approvedCount === orderedPlatformPosts.length;
   const publishLabel =
     scheduleCount === 0
       ? `Publish to ${nowCount} platform${nowCount === 1 ? '' : 's'}`
@@ -245,6 +328,20 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
 
   return (
     <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+      <View style={styles.screenHeader}>
+        <Pressable
+          style={styles.backButton}
+          onPress={onBack}
+          accessibilityRole="button"
+          accessibilityLabel="Back to Compose"
+        >
+          <MaterialCommunityIcons name="arrow-left" size={22} color={color.onSurface} />
+        </Pressable>
+        <View style={styles.screenHeaderCopy}>
+          <Text style={styles.screenTitle}>Review {orderedPlatformPosts.length} draft{orderedPlatformPosts.length === 1 ? '' : 's'}</Text>
+          <Text style={styles.screenSubtitle}>Edit and approve every word before publishing.</Text>
+        </View>
+      </View>
       <View>
         <Text style={styles.sectionLabel}>Your brief</Text>
         <Text style={styles.brief}>{post.brief}</Text>
@@ -256,6 +353,8 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
         const isRegenerating = regeneratingId === pp._id;
         const cardMode = modeFor(pp._id);
         const cardScheduledTime = scheduledTime[pp._id];
+        const textValue = editedText[pp._id] ?? pp.finalText;
+        const characterLimit = CHARACTER_LIMITS[pp.platform];
 
         return (
           <View key={pp._id} style={styles.card}>
@@ -273,7 +372,10 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
                 placeholder="Video title"
                 placeholderTextColor={color.onSurfaceFaint}
                 value={editedTitle[pp._id] ?? ''}
-                onChangeText={(value) => setEditedTitle((prev) => ({ ...prev, [pp._id]: value }))}
+                onChangeText={(value) => {
+                  setEditedTitle((prev) => ({ ...prev, [pp._id]: value }));
+                  setApprovedIds((prev) => { const next = new Set(prev); next.delete(pp._id); return next; });
+                }}
               />
             ) : null}
 
@@ -281,9 +383,20 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
               style={styles.textInput}
               multiline
               placeholderTextColor={color.onSurfaceFaint}
-              value={editedText[pp._id] ?? pp.finalText}
-              onChangeText={(value) => setEditedText((prev) => ({ ...prev, [pp._id]: value }))}
+              value={textValue}
+              onChangeText={(value) => {
+                setEditedText((prev) => ({ ...prev, [pp._id]: value }));
+                setApprovedIds((prev) => { const next = new Set(prev); next.delete(pp._id); return next; });
+              }}
             />
+            <View style={styles.budgetRow}>
+              <Text style={[styles.budgetText, characterLimit !== undefined && textValue.length > characterLimit && styles.budgetOver]}>
+                {textValue.length}{characterLimit !== undefined ? ` / ${characterLimit}` : ''}
+              </Text>
+              <Text style={styles.ruleHint}>
+                {PLATFORMS_ALLOWING_HASHTAGS.includes(pp.platform) ? 'Specific hashtags only' : 'No generic hashtags'}
+              </Text>
+            </View>
 
             {autoFixed.length > 0 ? (
               <View style={styles.autoFixedNote}>
@@ -294,7 +407,14 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
               </View>
             ) : null}
 
-            {flagged.map((finding, index) => (
+            {flagged.length === 0 ? (
+              <View style={styles.cleanRow}>
+                <MaterialCommunityIcons name="check-circle-outline" size={15} color={color.success} />
+                <Text style={styles.cleanText}>Reads clean</Text>
+              </View>
+            ) : null}
+
+            {flagged.map((finding, index) => dismissedFindings.has(`${pp._id}-${index}`) ? null : (
               <View key={`${finding.rule}-${index}`} style={styles.warningChip}>
                 <View style={styles.warningHeader}>
                   <MaterialCommunityIcons name="alert-outline" size={13} color={color.warning} />
@@ -302,6 +422,14 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
                 </View>
                 <Text style={styles.warningQuote}>&ldquo;{finding.quote}&rdquo;</Text>
                 <Text style={styles.warningSuggestion}>{finding.suggestion}</Text>
+                <View style={styles.findingActions}>
+                  <Pressable style={styles.applyFindingButton} onPress={() => applyFinding(pp, index, finding.quote, finding.suggestion)}>
+                    <Text style={styles.applyFindingText}>Apply suggestion</Text>
+                  </Pressable>
+                  <Pressable style={styles.keepFindingButton} onPress={() => setDismissedFindings((prev) => new Set(prev).add(`${pp._id}-${index}`))}>
+                    <Text style={styles.keepFindingText}>Keep mine</Text>
+                  </Pressable>
+                </View>
               </View>
             ))}
 
@@ -378,23 +506,36 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
                   ) : null}
 
                   {cardScheduledTime !== undefined ? (
-                    <Pressable
-                      style={styles.applyAllButton}
-                      onPress={() => applyTimeToAll(pp._id)}
-                      hitSlop={{ top: 8, bottom: 8 }}
-                      android_ripple={{ color: color.outline }}
-                    >
-                      <MaterialCommunityIcons name="content-copy" size={13} color={color.onSurfaceVariant} />
-                      <Text style={styles.applyAllButtonText}>Apply this time to all</Text>
-                    </Pressable>
+                    <>
+                      <Text style={styles.timezoneText}>
+                        {Intl.DateTimeFormat().resolvedOptions().timeZone} · {relativeFuture(cardScheduledTime)}
+                      </Text>
+                      <Pressable
+                        style={styles.applyAllButton}
+                        onPress={() => applyTimeToAll(pp._id)}
+                        hitSlop={{ top: 8, bottom: 8 }}
+                        android_ripple={{ color: color.outline }}
+                      >
+                        <MaterialCommunityIcons name="content-copy" size={13} color={color.onSurfaceVariant} />
+                        <Text style={styles.applyAllButtonText}>Apply this time to all</Text>
+                      </Pressable>
+                    </>
                   ) : null}
                 </View>
               ) : null}
             </View>
 
-            <Pressable
+            {confirmRegenerateId === pp._id ? (
+              <View style={styles.regenerateGuard}>
+                <Text style={styles.regenerateGuardText}>Regenerating replaces your edits for {PLATFORM_LABELS[pp.platform]} only.</Text>
+                <View style={styles.findingActions}>
+                  <Pressable style={styles.applyFindingButton} onPress={() => handleRegenerate(pp)}><Text style={styles.applyFindingText}>Regenerate</Text></Pressable>
+                  <Pressable style={styles.keepFindingButton} onPress={() => setConfirmRegenerateId(null)}><Text style={styles.keepFindingText}>Keep my version</Text></Pressable>
+                </View>
+              </View>
+            ) : <Pressable
               style={styles.regenerateButton}
-              onPress={() => handleRegenerate(pp)}
+              onPress={() => textValue !== pp.generatedText ? setConfirmRegenerateId(pp._id) : handleRegenerate(pp)}
               disabled={isRegenerating}
               hitSlop={{ top: 6, bottom: 6 }}
               android_ripple={{ color: color.outline }}
@@ -407,6 +548,24 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
                   <Text style={styles.regenerateButtonText}>Regenerate</Text>
                 </>
               )}
+            </Pressable>}
+
+            <Pressable
+              style={[styles.approveButton, approvedIds.has(pp._id) && styles.approveButtonDone]}
+              onPress={() => setApprovedIds((prev) => {
+                const next = new Set(prev);
+                next.has(pp._id) ? next.delete(pp._id) : next.add(pp._id);
+                return next;
+              })}
+            >
+              <MaterialCommunityIcons
+                name={approvedIds.has(pp._id) ? 'check-circle' : 'check-circle-outline'}
+                size={18}
+                color={approvedIds.has(pp._id) ? color.success : color.onPrimary}
+              />
+              <Text style={[styles.approveButtonText, approvedIds.has(pp._id) && styles.approveButtonTextDone]}>
+                {approvedIds.has(pp._id) ? 'Approved' : 'Approve this draft'}
+              </Text>
             </Pressable>
           </View>
         );
@@ -420,9 +579,9 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
       ) : null}
 
       <Pressable
-        style={[styles.publishButton, publishing && styles.publishButtonDisabled]}
+        style={[styles.publishButton, (!allApproved || publishing) && styles.publishButtonDisabled]}
         onPress={handlePublish}
-        disabled={publishing}
+        disabled={publishing || !allApproved}
         android_ripple={{ color: color.onPrimary }}
       >
         {publishing ? (
@@ -430,7 +589,9 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
         ) : (
           <>
             <MaterialCommunityIcons name={publishIcon} size={18} color={color.onPrimary} />
-            <Text style={styles.publishButtonText}>{publishLabel}</Text>
+            <Text style={styles.publishButtonText}>
+              {allApproved ? publishLabel : `Approve all to continue · ${approvedCount} of ${orderedPlatformPosts.length}`}
+            </Text>
           </>
         )}
       </Pressable>
@@ -445,6 +606,18 @@ export default function ReviewScreen({ postId, platforms, onPublished }: ReviewS
 const styles = StyleSheet.create({
   container: { padding: space.xl, paddingTop: space.xxl, gap: space.lg, paddingBottom: space.xxxl },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: space.md },
+  screenHeader: { flexDirection: 'row', alignItems: 'center', gap: space.md },
+  backButton: {
+    width: touchTarget,
+    height: touchTarget,
+    borderRadius: radius.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: color.surface,
+  },
+  screenHeaderCopy: { flex: 1 },
+  screenTitle: { ...type.titleLarge, color: color.onBackground },
+  screenSubtitle: { ...type.bodyMedium, color: color.onSurfaceVariant, marginTop: 2 },
   emptyText: { ...type.bodyMedium, color: color.onSurfaceFaint },
   sectionLabel: { ...type.labelMedium, color: color.onSurfaceVariant, marginBottom: space.xs },
   brief: { ...type.titleMedium, color: color.onSurface },
@@ -478,6 +651,10 @@ const styles = StyleSheet.create({
     minHeight: 90,
     textAlignVertical: 'top',
   },
+  budgetRow: { flexDirection: 'row', justifyContent: 'space-between', gap: space.sm },
+  budgetText: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none' },
+  budgetOver: { color: color.error },
+  ruleHint: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none' },
   autoFixedNote: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
   autoFixedText: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none', fontStyle: 'italic', flex: 1 },
   warningChip: {
@@ -490,6 +667,13 @@ const styles = StyleSheet.create({
   warningRule: { ...type.labelSmall, color: color.warning },
   warningQuote: { ...type.bodyMedium, fontSize: 13, color: color.onWarningContainer },
   warningSuggestion: { ...type.labelSmall, color: color.onWarningContainer, textTransform: 'none', opacity: 0.85 },
+  findingActions: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm, marginTop: space.xs },
+  applyFindingButton: { minHeight: 40, justifyContent: 'center', paddingHorizontal: space.md, borderRadius: radius.sm, backgroundColor: color.primary },
+  applyFindingText: { ...type.labelMedium, color: color.onPrimary, textTransform: 'none' },
+  keepFindingButton: { minHeight: 40, justifyContent: 'center', paddingHorizontal: space.md, borderRadius: radius.sm, backgroundColor: color.surface },
+  keepFindingText: { ...type.labelMedium, color: color.onSurfaceVariant, textTransform: 'none' },
+  cleanRow: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
+  cleanText: { ...type.labelMedium, color: color.success, textTransform: 'none' },
   inlineError: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
   inlineErrorText: { ...type.bodyMedium, fontSize: 13, color: color.onErrorContainer, flex: 1 },
   viewPostButton: {
@@ -563,6 +747,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: space.sm,
   },
   applyAllButtonText: { ...type.labelSmall, color: color.onSurfaceVariant, textTransform: 'none' },
+  timezoneText: { ...type.labelSmall, color: color.onSurfaceFaint, textTransform: 'none' },
   errorBanner: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -585,6 +770,12 @@ const styles = StyleSheet.create({
     minHeight: 36,
   },
   regenerateButtonText: { ...type.labelMedium, color: color.onSurfaceVariant, textTransform: 'none' },
+  regenerateGuard: { backgroundColor: color.warningContainer, borderRadius: radius.sm, padding: space.md, gap: space.sm },
+  regenerateGuardText: { ...type.bodyMedium, color: color.onWarningContainer },
+  approveButton: { minHeight: touchTarget, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: space.sm, borderRadius: radius.sm, backgroundColor: color.primary },
+  approveButtonDone: { backgroundColor: color.successContainer },
+  approveButtonText: { ...type.labelLarge, color: color.onPrimary, textTransform: 'none' },
+  approveButtonTextDone: { color: color.success },
   publishButton: {
     flexDirection: 'row',
     alignItems: 'center',

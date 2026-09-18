@@ -14,6 +14,10 @@ export const schedulePlatformPosts = mutation({
   returns: v.null(),
   handler: async (ctx, args) => {
     for (const item of args.items) {
+      const existing = await ctx.db.get(item.platformPostId);
+      if (existing?.scheduledFunctionId) {
+        await ctx.scheduler.cancel(existing.scheduledFunctionId as Id<'_scheduled_functions'>);
+      }
       const functionId = await ctx.scheduler.runAt(
         item.scheduledFor,
         internal.publishPost.publishScheduledPlatformPost,
